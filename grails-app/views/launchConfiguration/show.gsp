@@ -30,6 +30,19 @@
     <div class="buttons">
       <g:form>
         <input type="hidden" name="name" value="${lc.launchConfigurationName}"/>
+        <g:link class="edit" action="edit" id="${lc.launchConfigurationName}"
+        	params="[id: lc.launchConfigurationName,
+        			userData: lc.userData,
+        			imageId: lc.imageId,
+        			instanceType: lc.instanceType,
+        			spotPrice: lc.spotPrice,
+        			securityGroups: lc.securityGroups,
+        			keyName: lc.keyName,
+        			kernelId: lc.kernelId,
+        			ramdiskId: lc.ramdiskId,
+        			ebsOptimized: lc.ebsOptimized,
+        			iamInstanceProfile: lc.iamInstanceProfile]"
+       		>Edit Launch Configuration</g:link>
         <g:buttonSubmit class="delete" action="delete" value="Delete Launch Configuration"
                 data-warning="Really delete Launch Configuration '${lc.launchConfigurationName}'?" />
       </g:form>

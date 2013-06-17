@@ -15,12 +15,18 @@
  */
 package com.netflix.asgard
 
+import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
+import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.JanitorMode
+import com.netflix.asgard.model.InstancePriceType
+import com.netflix.asgard.model.Subnets
+import com.amazonaws.services.ec2.model.SecurityGroup
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
+import javax.xml.bind.DatatypeConverter
 import org.joda.time.DateTime
 import org.joda.time.format.DateTimeFormatter
 import org.joda.time.format.ISODateTimeFormat
@@ -33,7 +39,9 @@ class LaunchConfigurationController {
     def awsEc2Service
     def flagService
     def instanceTypeService
-
+	def spotInstanceRequestService
+	def taskService
+		
     def static allowedMethods = [delete:'POST', save:'POST', update:'POST', cleanup: 'POST', massDelete: 'POST']
 
     def index = { redirect(action: 'list', params:params) }
@@ -91,11 +99,11 @@ class LaunchConfigurationController {
             AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, name)
             String clusterName = Relationships.clusterFromGroupName(group?.autoScalingGroupName)
             def details = [
-                    'lc': lc,
-                    'image': awsEc2Service.getImage(userContext, lc.imageId),
-                    'app': applicationService.getRegisteredApplication(userContext, appName),
-                    'group': group,
-                    'cluster': clusterName
+                    lc: lc,
+                    image: awsEc2Service.getImage(userContext, lc.imageId),
+                    app: applicationService.getRegisteredApplication(userContext, appName),
+                    group: group,
+                    cluster: clusterName
             ]
             withFormat {
                 html { return details }
@@ -105,6 +113,114 @@ class LaunchConfigurationController {
         }
     }
 
+	def edit = {
+		UserContext userContext = UserContext.of(request)
+		String name = params.name ?: params.id
+        LaunchConfiguration lc = awsAutoScalingService.getLaunchConfiguration(userContext, name)
+		if (!lc) {
+			Requests.renderNotFound('Launch Configuration', name, this)
+			return
+		}
+		Subnets subnets = awsEc2Service.getSubnets(userContext)
+		Map<String, String> purposeToVpcId = subnets.mapPurposeToVpcId()
+        String subnetPurpose = params.subnetPurpose ?: null
+		String vpcId = purposeToVpcId[subnetPurpose]
+        String appName = Relationships.appNameFromLaunchConfigName(name)
+        AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, name)
+        String clusterName = Relationships.clusterFromGroupName(group?.autoScalingGroupName)
+		String recommendSpotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, params.instanceType)
+		List<SecurityGroup> effectiveGroups = awsEc2Service.getEffectiveSecurityGroups(userContext).sort {
+			it.groupName?.toLowerCase()
+		}
+
+		return [
+			lc: lc,
+            image: awsEc2Service.getImage(userContext, lc.imageId),
+            app: applicationService.getRegisteredApplication(userContext, appName),
+            group: group,
+            cluster: clusterName,
+			images: awsEc2Service.getAccountImages(userContext).sort { it.imageLocation.toLowerCase() },
+			instanceTypes: instanceTypeService.getInstanceTypes(userContext),
+			pricing: params.spotPrice == recommendSpotPrice ? InstancePriceType.SPOT.name() : InstancePriceType.ON_DEMAND.name(),
+			vpcId: vpcId,
+			securityGroupsGroupedByVpcId: effectiveGroups.groupBy { it.vpcId },
+			selectedSecurityGroups: Requests.ensureList(params.securityGroups),
+			keys: awsEc2Service.getKeys(userContext).sort { it.keyName.toLowerCase() },
+			defKey: awsEc2Service.defaultKeyName
+		]
+	}
+
+    def update = {
+
+		final String oldLaunchConfigName = params.name ?: params.id
+		UserContext userContext = UserContext.of(request)
+		AutoScalingGroup asg = awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, oldLaunchConfigName)
+		final String autoScalingGroupName = asg.autoScalingGroupName
+		final String newLaunchConfigName = Relationships.buildLaunchConfigurationName(autoScalingGroupName)	
+		//Launch Configuration
+		String imageId = params.imageId
+		String keyName = params.keyName
+		List<String> securityGroups = Requests.ensureList(params.selectedSecurityGroups)
+		String instanceType = params.instanceType
+		String encodedUserData = DatatypeConverter.printBase64Binary(params.userData.replaceAll("\r\n", "\n").getBytes())
+		String kernelId = params.kernelId ?: null
+		String ramdiskId = params.ramdiskId ?: null
+		String iamInstanceProfile = params.iamInstanceProfile ?: configService.defaultIamRole
+		String msg = "Create Launch Configuration: '${newLaunchConfigName}'."
+		String error = ""
+		String spotPrice = null
+		boolean ebsOptimized = params.ebsOptimized ? params.ebsOptimized.toBoolean() : false
+
+		if (params.pricing == InstancePriceType.SPOT.name()) {
+			spotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, instanceType)
+		}
+		
+		taskService.runTask(userContext, msg, { Task task ->
+			try {
+				awsAutoScalingService.createLaunchConfiguration(
+					userContext, newLaunchConfigName,
+					imageId, keyName, securityGroups,
+					encodedUserData, instanceType, kernelId,
+					ramdiskId, iamInstanceProfile, spotPrice,
+					ebsOptimized, task)
+			} catch (AmazonServiceException e) {
+				error = "Could not create new Launch Configuration: ${e} ${encodedUserData}"
+			}
+		}, Link.to(EntityType.launchConfiguration, newLaunchConfigName), null)
+		
+
+		if (awsAutoScalingService.getLaunchConfiguration(userContext, newLaunchConfigName) == null)	{
+			Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
+			flash.message = error
+			redirect(action: 'list', appNames: appNames)
+    	} else {
+		
+			try {	
+				final AutoScalingGroupData autoScalingGroupData = AutoScalingGroupData.forUpdate(	
+					autoScalingGroupName,	
+					newLaunchConfigName,	
+					asg.minSize,	
+					asg.desiredCapacity,	
+					asg.maxSize,	
+					asg.defaultCooldown,	
+					asg.healthCheckType,	
+					asg.healthCheckGracePeriod,	
+					asg.terminationPolicies,	
+					asg.availabilityZones)	
+				asg = awsAutoScalingService.updateAutoScalingGroup(userContext, autoScalingGroupData)	
+				awsAutoScalingService.deleteLaunchConfiguration(userContext, oldLaunchConfigName)
+				flash.message = "Launch Config '${oldLaunchConfigName}' has been replaced by '${newLaunchConfigName}'. "
+				redirect(action: 'show', name: newLaunchConfigName, params: [id: newLaunchConfigName])
+			} catch (AmazonServiceException e) {	
+				if (awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, newLaunchConfigName) == null) {	
+					awsAutoScalingService.deleteLaunchConfiguration(userContext, newLaunchConfigName)	
+				}
+				flash.message = "Could not delete old Launch Configuration: ${e}"
+				redirect(action: 'list', appNames: appNames)
+			}
+		}
+	}
+	
     def delete = {
         UserContext userContext = UserContext.of(request)
         def name = params.name
