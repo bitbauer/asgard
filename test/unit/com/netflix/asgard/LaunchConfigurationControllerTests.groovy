@@ -46,4 +46,44 @@ class LaunchConfigurationControllerTests {
         assert '/error/missing' == view
         assert "Launch Configuration 'doesntexist' not found in us-east-1 test" == controller.flash.message
     }
+	
+	void testUpdateWithoutMostParams() {
+		request.method = 'POST'
+		def p = controller.params
+		p.appName = 'helloworld'
+		def cmd = new LoadBalancerCreateCommand(appName: p.appName)
+		cmd.applicationService = Mocks.applicationService()
+		cmd.validate()
+		assert cmd.hasErrors()
+		controller.update(cmd)
+		assert response.redirectUrl == '/loadBalancer/create?appName=helloworld'
+		assert flash.chainModel.cmd == cmd
+	}
+
+	void testUpdateSuccessfully() {
+		request.method = 'POST'
+		def p = controller.params
+		p.appName = 'helloworld'
+		p.stack = 'unittest'
+		p.detail ='frontend'
+		p.protocol1 = 'HTTP'
+		p.lbPort1 = '80'
+		p.instancePort1 = '7001'
+		p.target = 'HTTP:7001/healthcheck'
+		p.interval = '40'
+		p.timeout = '40'
+		p.unhealthy = '40'
+		p.healthy = '40'
+		LoadBalancerCreateCommand cmd = new LoadBalancerCreateCommand(appName: p.appName, stack: p.stack,
+				detail: p.detail, protocol1: p.protocol1, lbPort1: p.lbPort1 as Integer,
+				instancePort1: p.instancePort1 as Integer, target: p.target, interval: p.interval as Integer,
+				timeout: p.timeout as Integer, unhealthy: p.unhealthy as Integer, healthy: p.healthy as Integer)
+		cmd.applicationService = Mocks.applicationService()
+		cmd.validate()
+		assert !cmd.hasErrors()
+		controller.update(cmd)
+		assert '/loadBalancer/show?name=helloworld-unittest-frontend' == response.redirectUrl
+		assert flash.message.startsWith("Load Balancer 'helloworld-unittest-frontend' has been created.")
+	}
+		
 }
